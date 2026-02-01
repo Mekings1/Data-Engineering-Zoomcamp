@@ -1,0 +1,96 @@
+id: tlc_data_load
+namespace: zoomcamp
+
+inputs:
+  - id: taxi
+    type: SELECT
+    displayName: Select taxi type
+    values: [ yellow, green ]
+    defaults: green
+
+  - id: year
+    type: SELECT
+    displayName: Select year
+    values: [ "2019", "2020", "2021" ]
+    defaults: "2019"
+
+  - id: month
+    type: ARRAY
+    itemType: STRING 
+    defaults: ["01", "02", "03", "04", "05", "06", "07", "08", "09", "10", "11", "12"]
+
+
+tasks:
+  - id: month_loop
+    type: io.kestra.plugin.core.flow.ForEach
+    concurrencyLimit: 1
+    values: "{{ inputs.month }}"
+    tasks:
+      - id: set_run_vars
+        type: io.kestra.plugin.core.execution.SetVariables
+        variables:
+          file_name: "{{inputs.taxi}}_tripdata_{{inputs.year}}-{{taskrun.value}}.csv"
+          s3_base_path: "nyc-taxi/{{inputs.taxi}}/{{inputs.year}}"
+
+      - id: extract_csv
+        type: io.kestra.plugin.scripts.shell.Commands
+        taskRunner:
+          type: io.kestra.plugin.core.runner.Process
+        commands:
+          - wget -qO- https://github.com/DataTalksClub/nyc-tlc-data/releases/download/{{inputs.taxi}}/{{render(vars.file_name)}}.gz | gunzip > data.csv
+          
+          # Log the size to the console. This was to enable me observe the file size during execution without saving the large csv files.
+          # This command takes the bytes, divides by 1024 twice, and rounds to 1 decimal place
+          - |
+            echo "REPORT - Month {{taskrun.value}} Size: $(du -b data.csv | awk '{printf "%.1fMB", $1/1024/1024}')"
+        outputFiles:
+          - data.csv
+
+      # Convert CSV to Parquet using DuckDB to reduce file size for upload to s3 and query efficiency
+      - id: convert_to_parquet
+        type: io.kestra.plugin.scripts.python.Script
+        taskRunner:
+          type: io.kestra.plugin.scripts.runner.docker.Docker
+        containerImage: "python:3.11-slim"
+        inputFiles:
+          data.csv: "{{ outputs.extract_csv[taskrun.value].outputFiles['data.csv'] }}"
+        beforeCommands:
+          - pip install duckdb
+        script: |
+          import duckdb
+          
+          file_name = "{{render(vars.file_name)}}"
+          
+          # Standardizing the SQL to use all_varchar=True
+          query = f"""
+            COPY (
+                SELECT *, '{file_name}.parquet' as filename 
+                FROM read_csv_auto('data.csv', all_varchar=True)
+            ) TO 'data.parquet' (FORMAT PARQUET);
+          """
+          
+          print(f"Converting {file_name} to Parquet...")
+          duckdb.query(query)
+          print("Success!")
+        outputFiles:
+          - data.parquet
+
+      # here we upload the parquet file to S3 bucket this is more efficient than inserting into postgres in our container running on Codespaces
+      - id: upload_to_full
+        type: io.kestra.plugin.aws.s3.Upload
+        from: "{{ outputs.convert_to_parquet[taskrun.value].outputFiles['data.parquet'] }}"
+        bucket: "{{ kv('bucket_name') }}"
+        key: "{{render(vars.s3_base_path)}}/full/{{render(vars.file_name)}}.parquet"
+
+      # Due to the large file sizes and Codespaces memory limitations we will clean up the internal storage after each month  runs.
+      - id: clean_up
+        type: io.kestra.plugin.core.storage.PurgeCurrentExecutionFiles
+        description: "Cleans up internal storage to keep Codespaces light"
+
+#AWS S3 plugin defaults to avoid repeating credentials configured in Kestra's key value store
+pluginDefaults:
+  - type: io.kestra.plugin.aws.s3
+    values:
+      accessKeyId: "{{ kv('AWS_ACCESS_KEY_ID') }}"
+      secretKeyId: "{{ kv('AWS_SECRET_KEY_ID') }}"
+      region: "eu-west-2"
