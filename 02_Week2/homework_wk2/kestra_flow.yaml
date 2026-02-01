@@ -60,11 +60,14 @@ tasks:
           import duckdb
           
           file_name = "{{render(vars.file_name)}}"
-          
+
+          # Remove .csv extension for naming consistency
+          base_name = file_name.replace('.csv', '')
+
           # Standardizing the SQL to use all_varchar=True
           query = f"""
             COPY (
-                SELECT *, '{file_name}.parquet' as filename 
+                SELECT *, '{base_name}.parquet' as filename 
                 FROM read_csv_auto('data.csv', all_varchar=True)
             ) TO 'data.parquet' (FORMAT PARQUET);
           """
